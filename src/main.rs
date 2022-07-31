@@ -39,9 +39,21 @@ enum Metadata {
 
 fn should_number(s: &str) -> bool {
     match s {
-        "Supply Depot" | "SCV" | "Missile Turret" | "Sensor Tower" => false,
+        "Supply Depot" | "SCV" | "Missile Turret" | "Sensor Tower" | "Bunker" | "Drone"
+        | "Zergling" | "Baneling" | "Roach" | "Ravager" | "Hydralisk" | "Lurker" | "Infestor"
+        | "Viper" | "Ultralisk" | "Swarm Host" | "Mutalisk" | "Corruptor" | "Brood Lord" | "Overlord"
+        | "Overseer" | "Spore Crawler" | "Spine Crawler" | "Probe" | "Pylon" | "Photon Cannon" => false,
         _ => true,
     }
+}
+
+fn batch_duration(s: &str) -> std::time::Duration {
+    std::time::Duration::from_secs(match s {
+        "Drone" | "Overlord" | "Overseer" | "Zergling" | "Baneling" | "Roach" | "Ravager" | "Hydralisk" | "Lurker" | "Infestor"
+        | "Viper" | "Ultralisk" | "Mutalisk" | "Corruptor" | "Brood Lord" => 3,
+        "SCV" | "Probe" => 10,
+        _ => 6,
+    })
 }
 
 type Supply = bounded_integer::BoundedU8<0, 200>;
@@ -80,6 +92,7 @@ fn main() {
     let mut per_item: HashMap<String, std::time::Duration> = HashMap::new();
     // Unupgraded CC count. Discard OC or PF items if count is 0.
     let mut cc_count = 1;
+    let mut supply = Supply::new(15).unwrap();
     for r in std::io::BufReader::new(file).lines() {
         let line = r.expect("failed to read line");
         let trimmed = line.trim();
@@ -120,6 +133,17 @@ fn main() {
                 .0
                 .push(captures[2].parse::<StringWithCount>().unwrap());
         }
+        fn add_supply_increase(
+            by_timestamp: &mut BTreeMap<std::time::Duration, (Vec<StringWithCount>, Vec<Metadata>)>,
+            complete_time: std::time::Duration,
+            supply: Supply,
+        ) {
+            by_timestamp
+                .entry(complete_time)
+                .or_default()
+                .1
+                .push(Metadata::SupplyIncrease(supply));
+        }
         if let Some(captures) = regex.captures(trimmed) {
             let timestamp = timestamp_to_duration(&captures["time"]);
             let items = captures["what"]
@@ -127,15 +151,21 @@ fn main() {
                 .filter_map(|s| {
                     let item = s.trim().parse::<StringWithCount>().unwrap();
                     match item.what.as_str() {
-                        "Command Center" => {
+                        "Command Center" | "Nexus" => {
                             cc_count += 1;
-                            by_timestamp
-                                .entry(timestamp + std::time::Duration::from_secs(71))
-                                .or_default()
-                                .1
-                                .push(Metadata::SupplyIncrease(
-                                    Supply::new(15).unwrap().saturating_mul(item.count),
-                                ));
+                            add_supply_increase(
+                                &mut by_timestamp,
+                                timestamp + std::time::Duration::from_secs(71),
+                                Supply::new(15).unwrap().saturating_mul(item.count),
+                            );
+                        }
+                        "Hatchery" => {
+                            cc_count += 1;
+                            add_supply_increase(
+                                &mut by_timestamp,
+                                timestamp + std::time::Duration::from_secs(71),
+                                Supply::new(6).unwrap().saturating_mul(item.count),
+                            );
                         }
                         "Orbital Command" | "Planetary Fortress" => {
                             if cc_count == 0 {
@@ -145,23 +175,30 @@ fn main() {
                             cc_count -= 1;
                         }
                         "Supply Depot" => {
-                            by_timestamp
-                                .entry(timestamp + std::time::Duration::from_secs(21))
-                                .or_default()
-                                .1
-                                .push(Metadata::SupplyIncrease(
-                                    Supply::new(8).unwrap().saturating_mul(item.count),
-                                ));
+                            add_supply_increase(
+                                &mut by_timestamp,
+                                timestamp + std::time::Duration::from_secs(21),
+                                Supply::new(8).unwrap().saturating_mul(item.count),
+                            );
+                        }
+                        "Overlord" | "Pylon" => {
+                            add_supply_increase(
+                                &mut by_timestamp,
+                                timestamp + std::time::Duration::from_secs(18),
+                                Supply::new(8).unwrap().saturating_mul(item.count),
+                            );
                         }
                         _ => {}
+                    }
+                    // Use the presence of an Overlord to know that it's Zerg and adjust
+                    // starting supply to 14.
+                    if item.what.as_str() == "Overlord" {
+                        supply = Supply::new(14).unwrap();
                     }
                     match per_item.entry(item.what.clone()) {
                         std::collections::hash_map::Entry::Occupied(mut occupied) => {
                             let past = *occupied.get();
-                            let duration = match item.what.as_str() {
-                                "SCV" => std::time::Duration::from_secs(10),
-                                _ => std::time::Duration::from_secs(6),
-                            };
+                            let duration = batch_duration(item.what.as_str());
                             if timestamp - past <= duration {
                                 for StringWithCount { what, count } in
                                     by_timestamp.get_mut(&past).unwrap().0.iter_mut()
@@ -193,8 +230,13 @@ fn main() {
     // Output the file.
     // Keep counts per item, write out up to 10.
     // Keep track of supply, overwrite when given an annotation, append value to Depots.
-    let mut count_by_item: HashMap<String, u8> = HashMap::new();
-    let mut supply = Supply::new(15).unwrap();
+    let mut count_by_item: HashMap<String, u8> = [
+        ("Command Center".to_string(), 1),
+        ("Hatchery".to_string(), 1),
+        ("Nexus".to_string(), 1),
+    ]
+    .into_iter()
+    .collect();
     let mut writer = std::io::BufWriter::new(std::fs::File::create(out_file).unwrap());
     for (timestamp, (items, meta)) in by_timestamp.into_iter() {
         for metadata in meta.into_iter() {
@@ -274,10 +316,13 @@ fn main() {
                 if annotation.len() > 0 {
                     write!(writer, " {}", annotation).unwrap();
                 }
-                if what == "Supply Depot" {
-                    if supply < 200 {
-                        write!(writer, " {}", supply).unwrap();
+                match what.as_ref() {
+                    "Supply Depot" | "Overlord" | "Pylon" => {
+                        if supply < 200 {
+                            write!(writer, " {}", supply).unwrap();
+                        }
                     }
+                    _ => {}
                 }
             }
         }
