@@ -6,12 +6,12 @@ use std::{
 type Sexag = bounded_integer::BoundedU8<0, 59>;
 
 #[derive(Debug, PartialEq, Eq)]
-struct StringWithCount {
+struct BuildItem {
     what: String,
     count: u8,
 }
 
-impl std::str::FromStr for StringWithCount {
+impl std::str::FromStr for BuildItem {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -39,18 +39,42 @@ enum Metadata {
 
 fn should_number(s: &str) -> bool {
     match s {
-        "Supply Depot" | "SCV" | "Missile Turret" | "Sensor Tower" | "Bunker" | "Drone"
-        | "Zergling" | "Baneling" | "Roach" | "Ravager" | "Hydralisk" | "Lurker" | "Infestor"
-        | "Viper" | "Ultralisk" | "Swarm Host" | "Mutalisk" | "Corruptor" | "Brood Lord" | "Overlord"
-        | "Overseer" | "Spore Crawler" | "Spine Crawler" | "Probe" | "Pylon" | "Photon Cannon" => false,
+        "Supply Depot"
+        | "SCV"
+        | "Missile Turret"
+        | "Sensor Tower"
+        | "Bunker"
+        | "Drone"
+        | "Zergling"
+        | "Baneling"
+        | "Roach"
+        | "Ravager"
+        | "Hydralisk"
+        | "Lurker"
+        | "Infestor"
+        | "Viper"
+        | "Ultralisk"
+        | "Swarm Host"
+        | "Mutalisk"
+        | "Corruptor"
+        | "Brood Lord"
+        | "Overlord"
+        | "Overseer"
+        | "Spore Crawler"
+        | "Spine Crawler"
+        | "Probe"
+        | "Probe (Chrono Boost)"
+        | "Pylon"
+        | "Photon Cannon" => false,
         _ => true,
     }
 }
 
 fn batch_duration(s: &str) -> std::time::Duration {
     std::time::Duration::from_secs(match s {
-        "Drone" | "Overlord" | "Overseer" | "Zergling" | "Baneling" | "Roach" | "Ravager" | "Hydralisk" | "Lurker" | "Infestor"
-        | "Viper" | "Ultralisk" | "Mutalisk" | "Corruptor" | "Brood Lord" => 3,
+        "Drone" | "Overlord" | "Overseer" | "Zergling" | "Baneling" | "Roach" | "Ravager"
+        | "Hydralisk" | "Lurker" | "Infestor" | "Viper" | "Ultralisk" | "Mutalisk"
+        | "Corruptor" | "Brood Lord" => 3,
         "SCV" | "Probe" => 10,
         _ => 6,
     })
@@ -58,12 +82,22 @@ fn batch_duration(s: &str) -> std::time::Duration {
 
 type Supply = bounded_integer::BoundedU8<0, 200>;
 
+fn write_shorthand(writer: &mut impl std::io::Write, supply: Supply) -> std::io::Result<()> {
+    if supply < 100 {
+        write!(writer, "{}", supply)
+    } else {
+        write!(writer, "{} {:02}", supply / 100, supply % 100)
+    }
+}
+
 fn timestamp_to_duration(s: &str) -> std::time::Duration {
     let (minutes, seconds) = s.split_once(':').unwrap();
     let minutes = minutes.parse::<Sexag>().unwrap();
     let seconds = seconds.parse::<Sexag>().unwrap();
     std::time::Duration::from_secs(u64::from(minutes) * 60 + u64::from(seconds))
 }
+
+type ByTimestamp = BTreeMap<std::time::Duration, (Vec<BuildItem>, Vec<Metadata>, Option<Supply>)>;
 
 fn main() {
     // Parse file into usable form.
@@ -84,15 +118,14 @@ fn main() {
     let annotation_regex = regex::Regex::new(r"^# \((.*)\) (.*)$").unwrap();
     let supply_regex = regex::Regex::new(r"^# \[Supply\] (.*)$").unwrap();
     let reminder_regex = regex::Regex::new(r"^# (\d{1,2}:\d{2}) (.*)$").unwrap();
-    let regex = regex::Regex::new(r"^\s*\d+\s+(?P<time>\d{1,2}:\d{2})\s+(?P<what>.*)$").unwrap();
-    let mut annotations: HashMap<String, std::collections::VecDeque<StringWithCount>> =
-        HashMap::new();
-    let mut by_timestamp: BTreeMap<std::time::Duration, (Vec<StringWithCount>, Vec<Metadata>)> =
-        BTreeMap::new();
+    let regex = regex::Regex::new(r"^\s*(?P<supply>\d+)\s+(?P<time>\d{1,2}:\d{2})\s+(?P<what>.*)$")
+        .unwrap();
+    let mut annotations: HashMap<String, std::collections::VecDeque<BuildItem>> = HashMap::new();
+    let mut by_timestamp: ByTimestamp = BTreeMap::new();
     let mut per_item: HashMap<String, std::time::Duration> = HashMap::new();
     // Unupgraded CC count. Discard OC or PF items if count is 0.
     let mut cc_count = 1;
-    let mut supply = Supply::new(15).unwrap();
+    let mut supply_cap = Supply::new(15).unwrap();
     for r in std::io::BufReader::new(file).lines() {
         let line = r.expect("failed to read line");
         let trimmed = line.trim();
@@ -102,7 +135,7 @@ fn main() {
                     captures[1].to_string(),
                     captures[2]
                         .split(',')
-                        .map(|s| s.trim().parse::<StringWithCount>().unwrap())
+                        .map(|s| s.trim().parse::<BuildItem>().unwrap())
                         .collect()
                 ),
                 None
@@ -131,10 +164,10 @@ fn main() {
                 .entry(timestamp)
                 .or_default()
                 .0
-                .push(captures[2].parse::<StringWithCount>().unwrap());
+                .push(captures[2].parse::<BuildItem>().unwrap());
         }
         fn add_supply_increase(
-            by_timestamp: &mut BTreeMap<std::time::Duration, (Vec<StringWithCount>, Vec<Metadata>)>,
+            by_timestamp: &mut ByTimestamp,
             complete_time: std::time::Duration,
             supply: Supply,
         ) {
@@ -145,11 +178,13 @@ fn main() {
                 .push(Metadata::SupplyIncrease(supply));
         }
         if let Some(captures) = regex.captures(trimmed) {
+            let supply = captures["supply"].parse::<Supply>().unwrap();
             let timestamp = timestamp_to_duration(&captures["time"]);
+            by_timestamp.entry(timestamp).or_default().2.replace(supply);
             let items = captures["what"]
                 .split(",")
                 .filter_map(|s| {
-                    let item = s.trim().parse::<StringWithCount>().unwrap();
+                    let item = s.trim().parse::<BuildItem>().unwrap();
                     match item.what.as_str() {
                         "Command Center" | "Nexus" => {
                             cc_count += 1;
@@ -193,14 +228,14 @@ fn main() {
                     // Use the presence of an Overlord to know that it's Zerg and adjust
                     // starting supply to 14.
                     if item.what.as_str() == "Overlord" {
-                        supply = Supply::new(14).unwrap();
+                        supply_cap = Supply::new(14).unwrap();
                     }
                     match per_item.entry(item.what.clone()) {
                         std::collections::hash_map::Entry::Occupied(mut occupied) => {
                             let past = *occupied.get();
                             let duration = batch_duration(item.what.as_str());
                             if timestamp - past <= duration {
-                                for StringWithCount { what, count } in
+                                for BuildItem { what, count } in
                                     by_timestamp.get_mut(&past).unwrap().0.iter_mut()
                                 {
                                     if *what == item.what {
@@ -238,12 +273,12 @@ fn main() {
     .into_iter()
     .collect();
     let mut writer = std::io::BufWriter::new(std::fs::File::create(out_file).unwrap());
-    for (timestamp, (items, meta)) in by_timestamp.into_iter() {
+    for (timestamp, (items, meta, supply)) in by_timestamp.into_iter() {
         for metadata in meta.into_iter() {
             match metadata {
-                Metadata::Supply(dropped) => supply = dropped,
+                Metadata::Supply(dropped) => supply_cap = dropped,
                 Metadata::SupplyIncrease(increase) => {
-                    supply = supply.saturating_add(increase.into())
+                    supply_cap = supply_cap.saturating_add(increase.into())
                 }
             }
         }
@@ -261,7 +296,7 @@ fn main() {
             )
             .unwrap();
         let mut comma = false;
-        for StringWithCount {
+        for BuildItem {
             what,
             count: mut add_count,
         } in items.into_iter()
@@ -318,8 +353,14 @@ fn main() {
                 }
                 match what.as_ref() {
                     "Supply Depot" | "Overlord" | "Pylon" => {
-                        if supply < 200 {
-                            write!(writer, " {}", supply).unwrap();
+                        if supply_cap < 200 {
+                            if let Some(supply) = supply {
+                                write!(writer, " ").unwrap();
+                                write_shorthand(&mut writer, supply).unwrap();
+                                write!(writer, " of").unwrap();
+                            }
+                            write!(writer, " ").unwrap();
+                            write_shorthand(&mut writer, supply_cap).unwrap();
                         }
                     }
                     _ => {}
